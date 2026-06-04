@@ -65,7 +65,7 @@
       },
       {
         "command": "WriteEscapedFile",
-        "description": "功能: 专用于写入内容本身包含VCP标准指令界定符的文件，特别是用于生成plugin-manifest.json。此命令会先将内容中的特殊转义界定符替换为标准界定符，然后再写入文件。当AI需要生成一个包含调用示例的插件描述文件时，必须使用此命令以避免解析错误。\n转义规则:\n- 「始exp」 -> 「始」\n- 「末exp」 -> 「末」\n- <<<[TOOL_REQUEST_EXP]>>> -> <<<[TOOL_REQUEST]>>>\n- <<<[END_TOOL_REQUEST_EXP]>>> -> <<<[END_TOOL_REQUEST]>>>\n参数:\n- filePath (字符串, 必需): 要写入的文件的绝对路径。\n- content (字符串, 必需): 要写入文件的内容，其中应使用上述转义规则。\n- encoding (字符串, 可选, 默认'utf8'): 写入时使用的文件编码。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」WriteEscapedFile「末」,\nfilePath:「始」/path/to/new_plugin/plugin-manifest.json「末」,\ncontent:「始」{\n  \"description\": \"...调用格式:\\n<<<[TOOL_REQUEST_EXP]>>>\\ntool_name:「始exp」MyNewPlugin「末exp」,\\n...\\n<<<[END_TOOL_REQUEST_EXP]>>>\"\n}「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "功能: 专用于写入内容本身包含VCP标准指令界定符的文件，特别是用于生成plugin-manifest.json。此命令会先将内容中的特殊转义界定符替换为标准界定符，然后再写入文件。当AI需要生成一个包含调用示例的插件描述文件时，必须使用此命令以避免解析错误。\n转义规则:\n- 「始ESCAPE」 -> 「始」\n- 「末ESCAPE」 -> 「末」\n- <<<[TOOL_REQUEST_ESCAPE]>>> -> <<<[TOOL_REQUEST]>>>\n- <<<[END_TOOL_REQUEST_ESCAPE]>>> -> <<<[END_TOOL_REQUEST]>>>\n参数:\n- filePath (字符串, 必需): 要写入的文件的绝对路径。\n- content (字符串, 必需): 要写入文件的内容，其中应使用上述转义规则。\n- encoding (字符串, 可选, 默认'utf8'): 写入时使用的文件编码。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」WriteEscapedFile「末」,\nfilePath:「始」/path/to/new_plugin/plugin-manifest.json「末」,\ncontent:「始」{\n  \"description\": \"...调用格式:\\n<<<[TOOL_REQUEST_ESCAPE]>>>\\ntool_name:「始ESCAPE」MyNewPlugin「末ESCAPE」,\\n...\\n<<<[END_TOOL_REQUEST_ESCAPE]>>>\"\n}「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
       {
         "command": "AppendFile",
@@ -109,7 +109,7 @@
       },
       {
         "command": "DownloadFile",
-        "description": "功能: (异步) 从一个URL地址下载文件到指定目录或默认下载目录中。插件会自动从URL中解析文件名。这是一个异步操作，命令会立即返回，告知AI下载已在后台开始以及文件的最终保存路径，AI无需等待下载完成。如果目标路径已存在同名文件，会自动重命名以防止覆盖。\n参数:\n- url (字符串, 必需): 要下载的文件的完整URL地址。\n- downloadDir (字符串, 可选): 指定下载目录的绝对路径。如果不提供，将使用.env配置中的DEFAULT_DOWNLOAD_DIR，若未配置则默认为AppData/file目录。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」,\ndownloadDir:「始」/path/to/custom/download/folder「末」\n<<<[END_TOOL_REQUEST]>>>\n或使用默认目录:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "功能: (异步) 从一个URL地址下载文件到指定目录中，支持自定义保存文件名。这是一个异步操作，命令会立即返回，告知AI下载已在后台开始以及文件的最终保存路径，AI无需等待下载完成。如果目标路径已存在同名文件，会自动重命名以防止覆盖。\n参数:\n- url (字符串, 必需): 要下载的文件的完整URL地址。\n- downloadDir (字符串, 可选): 指定下载目录的绝对路径。如果不提供，将使用config.env中的DEFAULT_DOWNLOAD_DIR，若未配置则默认为AppData/file目录。\n- fileName (字符串, 可选): 自定义保存的文件名（含扩展名，例如 'my_report.pdf'）。如果不提供，将自动从URL中解析文件名。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」,\ndownloadDir:「始」/path/to/custom/download/folder「末」,\nfileName:「始」my_archive.zip「末」\n<<<[END_TOOL_REQUEST]>>>\n或仅指定下载目录:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」,\ndownloadDir:「始」/path/to/custom/download/folder「末」\n<<<[END_TOOL_REQUEST]>>>\n或使用默认目录和自动文件名:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
       {
         "command": "ApplyDiff",

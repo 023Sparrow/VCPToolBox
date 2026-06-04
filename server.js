@@ -1,5 +1,6 @@
 // server.js
 const express = require('express');
+require('./modules/dotenvPatch.js'); // 应用 dotenv.parse 补丁以支持特殊字符
 const dotenv = require('dotenv');
 dotenv.config({ path: 'config.env' });
 const schedule = require('node-schedule');
@@ -70,13 +71,49 @@ async function ensureAgentDirectory() {
         }
     }
 }
-const TVS_DIR = path.join(__dirname, 'TVStxt'); // 新增：定义 TVStxt 目录
+
+// TVStxt 目录路径初始化
+let TVS_DIR;
+
+function resolveTvsDir() {
+    const configPath = process.env.TVSTXT_DIR_PATH;
+
+    if (!configPath || typeof configPath !== 'string' || configPath.trim() === '') {
+        return path.join(__dirname, 'TVStxt');
+    }
+
+    const normalizedPath = path.normalize(configPath.trim());
+    const absolutePath = path.isAbsolute(normalizedPath)
+        ? normalizedPath
+        : path.resolve(__dirname, normalizedPath);
+
+    return absolutePath;
+}
+
+TVS_DIR = resolveTvsDir();
+
+// 确保 TVStxt 目录存在
+async function ensureTvsDirectory() {
+    try {
+        await fs.mkdir(TVS_DIR, { recursive: true });
+        console.log(`[Server] TVStxt directory: ${TVS_DIR}`);
+    } catch (error) {
+        if (error.code !== 'EEXIST') {
+            console.error(`[Server] Failed to create TVStxt directory: ${TVS_DIR}`);
+        }
+    }
+}
+
 const crypto = require('crypto');
 const agentManager = require('./modules/agentManager.js'); // 新增：Agent管理器
 const tvsManager = require('./modules/tvsManager.js'); // 新增：TVS管理器
+const toolboxManager = require('./modules/toolboxManager.js');
+const dynamicToolRegistry = require('./modules/dynamicToolRegistry.js');
 const messageProcessor = require('./modules/messageProcessor.js');
 const knowledgeBaseManager = require('./KnowledgeBaseManager.js'); // 新增：引入统一知识库管理器
+const tdbKnowledgeManager = require('./TDBKnowledge.js'); // 新增：引入 TriviumDB 冷知识库管理器
 const pluginManager = require('./Plugin.js');
+const sarPromptManager = require('./modules/sarPromptManager.js');
 const taskScheduler = require('./routes/taskScheduler.js');
 const webSocketServer = require('./WebSocketServer.js'); // 新增 WebSocketServer 引入
 const FileFetcherServer = require('./FileFetcherServer.js'); // 引入新的 FileFetcherServer 模块
@@ -91,13 +128,225 @@ const apiErrorCounts = new Map();
 
 const loginAttempts = new Map();
 const tempBlocks = new Map();
-const MAX_LOGIN_ATTEMPTS = 5; // 15分钟内最多尝试5次
+const noCredentialAccess = new Map(); // 无凭据访问计数（防DDoS探测）
+const MAX_LOGIN_ATTEMPTS = 5; // 15分钟内最多尝试5次（错误凭据）
+const MAX_NO_CREDENTIAL_REQUESTS = 100; // 15分钟内无凭据访问上限（防DDoS探测）
 const LOGIN_ATTEMPT_WINDOW = 15 * 60 * 1000; // 15分钟的窗口
-const TEMP_BLOCK_DURATION = 30 * 60 * 1000; // 封禁30分钟
+const TEMP_BLOCK_DURATION = 30 * 60 * 1000; // 封禁30分钟（错误凭据触发）
+const NO_CREDENTIAL_BLOCK_DURATION = 15 * 60 * 1000; // 封禁15分钟（无凭据DDoS触发）
 
 const ChatCompletionHandler = require('./modules/chatCompletionHandler.js');
+const ToolCallParser = require('./modules/vcpLoop/toolCallParser.js');
 
 const activeRequests = new Map(); // 新增：用于存储活动中的请求，以便中止
+
+const SERVER_LIFECYCLE = Object.freeze({
+    RUNNING: 'RUNNING',
+    DRAINING: 'DRAINING',
+    SHUTTING_DOWN: 'SHUTTING_DOWN',
+    EXITING: 'EXITING'
+});
+
+let serverLifecycleState = SERVER_LIFECYCLE.RUNNING;
+let shutdownPromise = null;
+let shutdownStartedAt = null;
+let shutdownReason = null;
+let lastShutdownExitCode = 0;
+let forceShutdownTimer = null;
+const trackedSockets = new Set();
+const activeHttpRequests = new Set();
+
+function getServerLifecycleStatus() {
+    return {
+        state: serverLifecycleState,
+        reason: shutdownReason,
+        startedAt: shutdownStartedAt,
+        uptimeMsInState: shutdownStartedAt ? Date.now() - shutdownStartedAt : 0,
+        activeRequestCount: activeRequests.size
+    };
+}
+
+function isServerDraining() {
+    return serverLifecycleState !== SERVER_LIFECYCLE.RUNNING;
+}
+
+function buildDrainingResponse(req) {
+    const lifecycleStatus = getServerLifecycleStatus();
+    const isStreamRequest = req?.body?.stream === true;
+    const message = '服务正在重启/关闭中，暂时不再接受新的请求。';
+
+    if (isStreamRequest) {
+        return {
+            type: 'stream',
+            status: 200,
+            headers: {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive'
+            },
+            body: {
+                id: `chatcmpl-draining-${Date.now()}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: req?.body?.model || 'unknown',
+                choices: [{
+                    index: 0,
+                    delta: { content: message },
+                    finish_reason: 'stop'
+                }],
+                lifecycle: lifecycleStatus
+            }
+        };
+    }
+
+    return {
+        type: 'json',
+        status: 503,
+        body: {
+            error: 'Service Unavailable',
+            message,
+            lifecycle: lifecycleStatus
+        }
+    };
+}
+
+function sendDrainingResponse(req, res) {
+    const payload = buildDrainingResponse(req);
+
+    if (payload.type === 'stream') {
+        if (!res.headersSent) {
+            res.status(payload.status);
+            Object.entries(payload.headers).forEach(([key, value]) => res.setHeader(key, value));
+        }
+        res.write(`data: ${JSON.stringify(payload.body)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+    }
+
+    if (!res.headersSent) {
+        res.status(payload.status).json(payload.body);
+    } else if (!res.writableEnded) {
+        res.end();
+    }
+}
+
+function destroyIdleSockets() {
+    let destroyedCount = 0;
+    for (const socket of trackedSockets) {
+        try {
+            const hasActiveRequest = activeHttpRequests.has(socket);
+            if (!hasActiveRequest && !socket.destroyed) {
+                socket.destroy();
+                destroyedCount++;
+            }
+        } catch (error) {
+            console.error('[Server] Failed to destroy idle socket:', error.message);
+        }
+    }
+    console.log(`[Server] Destroyed ${destroyedCount} idle socket(s).`);
+}
+
+async function closeHttpServerGracefully() {
+    if (!server || typeof server.close !== 'function') {
+        return;
+    }
+
+    console.log(`[Server] Preparing to close HTTP server. trackedSockets=${trackedSockets.size}, activeHttpRequests=${activeHttpRequests.size}`);
+
+    destroyIdleSockets();
+
+    await new Promise((resolve) => {
+        try {
+            server.close((error) => {
+                if (error) {
+                    console.error('[Server] Error while closing HTTP server:', error);
+                } else {
+                    console.log('[Server] HTTP server stopped accepting new connections.');
+                }
+                resolve();
+            });
+        } catch (error) {
+            console.error('[Server] Failed to invoke server.close():', error);
+            resolve();
+        }
+    });
+}
+
+async function waitForActiveRequestsToDrain(timeoutMs = 30000) {
+    const start = Date.now();
+
+    while (activeRequests.size > 0 && (Date.now() - start) < timeoutMs) {
+        console.log(`[Shutdown] Waiting for ${activeRequests.size} active request(s) to finish...`);
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    return activeRequests.size === 0;
+}
+
+async function abortAllActiveRequests(reason = '服务器正在关闭') {
+    console.log(`[Shutdown] Aborting ${activeRequests.size} active request(s)...`);
+
+    for (const [id, context] of activeRequests.entries()) {
+        try {
+            if (!context.aborted) {
+                context.aborted = true;
+            }
+
+            if (context.abortController && !context.abortController.signal.aborted) {
+                context.abortController.abort();
+            }
+
+            if (context.res && !context.res.writableEnded && !context.res.destroyed) {
+                const isStreamRequest = context.req?.body?.stream === true;
+
+                if (!context.res.headersSent) {
+                    if (isStreamRequest) {
+                        context.res.status(200);
+                        context.res.setHeader('Content-Type', 'text/event-stream');
+                        context.res.setHeader('Cache-Control', 'no-cache');
+                        context.res.setHeader('Connection', 'keep-alive');
+
+                        const shutdownChunk = {
+                            id: `chatcmpl-shutdown-${Date.now()}`,
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: context.req?.body?.model || 'unknown',
+                            choices: [{
+                                index: 0,
+                                delta: { content: reason },
+                                finish_reason: 'stop'
+                            }]
+                        };
+
+                        context.res.write(`data: ${JSON.stringify(shutdownChunk)}\n\n`);
+                        context.res.write('data: [DONE]\n\n');
+                        context.res.end();
+                    } else {
+                        context.res.status(503).json({
+                            error: 'Service Unavailable',
+                            message: reason
+                        });
+                    }
+                } else if (String(context.res.getHeader('Content-Type') || '').includes('text/event-stream')) {
+                    context.res.write('data: [DONE]\n\n');
+                    context.res.end();
+                } else {
+                    context.res.end();
+                }
+            }
+        } catch (error) {
+            console.error(`[Shutdown] Failed to abort active request ${id}:`, error.message);
+            try {
+                if (context.res && !context.res.destroyed) {
+                    context.res.destroy();
+                }
+            } catch (destroyError) {
+                console.error(`[Shutdown] Failed to destroy response for request ${id}:`, destroyError.message);
+            }
+        }
+    }
+}
 
 // 新增：定时清理 activeRequests 防止内存泄漏
 setInterval(() => {
@@ -118,6 +367,7 @@ const ADMIN_USERNAME = process.env.AdminUsername;
 const ADMIN_PASSWORD = process.env.AdminPassword;
 
 const DEBUG_MODE = (process.env.DebugMode || "False").toLowerCase() === "true";
+const CHAT_LOG_ENABLED = (process.env.CHAT_LOG_ENABLED || "false").toLowerCase() === "true";
 const VCPToolCode = (process.env.VCPToolCode || "false").toLowerCase() === "true"; // 新增：读取VCP工具调用验证码开关
 const SHOW_VCP_OUTPUT = (process.env.ShowVCP || "False").toLowerCase() === "true"; // 读取 ShowVCP 环境变量
 const RAG_MEMO_REFRESH = (process.env.RAGMemoRefresh || "false").toLowerCase() === "true"; // 新增：RAG日记刷新开关
@@ -151,6 +401,10 @@ const CHINA_MODEL_1_COT = (process.env.ChinaModel1Cot || "false").toLowerCase() 
 const ModelRedirectHandler = require('./modelRedirectHandler.js');
 const modelRedirectHandler = new ModelRedirectHandler();
 
+// 语义任务智能模型路由器
+const SemanticModelRouter = require('./modules/semanticModelRouter.js');
+const semanticModelRouter = new SemanticModelRouter();
+
 // ensureDebugLogDir is now ensureDebugLogDirSync and called by initializeServerLogger
 // writeDebugLog remains for specific debug purposes, it uses fs.promises.
 // 优化：Debug 日志按天归档到 archive/YYYY-MM-DD/Debug/ 目录
@@ -179,6 +433,29 @@ async function writeDebugLog(filenamePrefix, data) {
             console.error(`写入调试日志失败: ${filePath}`, error);
         }
     }
+}
+
+// ChatLog：在 DebugLog/chat/YYYY-MM-DD/ 下记录每次 chat 的请求体与响应（仅当 CHAT_LOG_ENABLED 时有效）
+let writeChatLog;
+if (CHAT_LOG_ENABLED) {
+    const crypto = require('crypto');
+    writeChatLog = function (requestBody, logs) {
+        const now = dayjs().tz(DEFAULT_TIMEZONE);
+        const dateStr = now.format('YYYY-MM-DD');
+        const timeStr = now.format('HHmmss_SSS');
+        const id = (requestBody && (requestBody.requestId || requestBody.messageId)) || 'no-id';
+        const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+        const shortRandom = crypto.randomBytes(2).toString('hex');
+        const filename = `chat-${safeId}-${timeStr}-${shortRandom}.json`;
+        const chatDir = path.join(__dirname, 'DebugLog', 'chat', dateStr);
+        const filePath = path.join(chatDir, filename);
+        const payload = logs;
+        fs.mkdir(chatDir, { recursive: true })
+            .then(() => fs.writeFile(filePath, JSON.stringify(payload, null, 2)))
+            .catch(e => console.error('[ChatLog] 写入失败:', e));
+    };
+} else {
+    writeChatLog = undefined;
 }
 
 // 新增：加载IP黑名单
@@ -308,6 +585,25 @@ app.use((req, res, next) => {
     next();
 });
 
+app.use((req, res, next) => {
+    if (isServerDraining()) {
+        const allowDuringShutdownPaths = new Set([
+            '/admin_api/server/restart',
+            '/admin_api/server/lifecycle',
+            '/v1/interrupt'
+        ]);
+        const allowDuringShutdown =
+            allowDuringShutdownPaths.has(req.path) ||
+            req.path.startsWith('/plugin-callback/');
+
+        if (!allowDuringShutdown) {
+            console.warn(`[Server] Rejecting new request during ${serverLifecycleState}: ${req.method} ${req.path}`);
+            return sendDrainingResponse(req, res);
+        }
+    }
+    next();
+});
+
 // 引入并使用特殊模型路由
 const specialModelRouter = require('./routes/specialModelRouter');
 app.use(specialModelRouter); // 这个将处理所有白名单模型的请求
@@ -338,6 +634,17 @@ const adminAuth = (req, res, next) => {
         // 验证登录的端点也需要特殊处理（允许无凭据时返回401而不是重定向）
         const isVerifyEndpoint = req.path === '/admin_api/verify-login';
 
+        // ========== 新增：只读仪表板接口白名单（不计入登录失败次数）==========
+        const readOnlyDashboardPaths = [
+            '/admin_api/system-monitor',
+            '/admin_api/newapi-monitor',
+            '/admin_api/server-log',
+            '/admin_api/user-auth-code',
+            '/admin_api/weather'
+        ];
+        const isReadOnlyPath = readOnlyDashboardPaths.some(path => req.path.startsWith(path));
+        // ========== 新增结束 ==========
+
         if (publicPaths.includes(req.path)) {
             return next(); // 直接放行登录页面相关资源
         }
@@ -363,9 +670,9 @@ const adminAuth = (req, res, next) => {
             return; // 停止进一步处理
         }
 
-        // 2. 检查IP是否被临时封禁
+        // 2. 检查IP是否被临时封禁（仅对非只读接口生效）
         const blockInfo = tempBlocks.get(clientIp);
-        if (blockInfo && Date.now() < blockInfo.expires) {
+        if (blockInfo && Date.now() < blockInfo.expires && !isReadOnlyPath) {
             console.warn(`[AdminAuth] Blocked login attempt from IP: ${clientIp}. Block expires at ${new Date(blockInfo.expires).toLocaleString()}.`);
             const timeLeft = Math.ceil((blockInfo.expires - Date.now()) / 1000 / 60);
             res.setHeader('Retry-After', Math.ceil((blockInfo.expires - Date.now()) / 1000)); // In seconds
@@ -407,7 +714,11 @@ const adminAuth = (req, res, next) => {
         // 4. 验证凭据
         if (!credentials || credentials.name !== ADMIN_USERNAME || credentials.pass !== ADMIN_PASSWORD) {
             // 认证失败，处理登录尝试计数
-            if (clientIp) {
+            // 🌟 关键修复：只有当用户主动提供了凭据（但凭据错误）时才计入失败次数
+            // 当 credentials 为 null 时（如 cookie 过期、用户登出后面板后台轮询），
+            // 不计入失败次数，避免面板挂着时 cookie 过期导致立即封禁 IP
+            const isActiveLoginAttempt = !!credentials;
+            if (clientIp && !isReadOnlyPath && isActiveLoginAttempt) {
                 const now = Date.now();
                 let attemptInfo = loginAttempts.get(clientIp) || { count: 0, firstAttempt: now };
 
@@ -425,6 +736,28 @@ const adminAuth = (req, res, next) => {
                     loginAttempts.delete(clientIp); // 封禁后清除尝试记录
                 } else {
                     loginAttempts.set(clientIp, attemptInfo);
+                }
+            }
+            // 🌟 防DDoS：无凭据访问独立计数，阈值更宽松（不影响正常 cookie 过期场景）
+            else if (clientIp && !isReadOnlyPath) {
+                const now = Date.now();
+                let accessInfo = noCredentialAccess.get(clientIp) || { count: 0, firstAccess: now };
+
+                if (now - accessInfo.firstAccess > LOGIN_ATTEMPT_WINDOW) {
+                    accessInfo = { count: 0, firstAccess: now };
+                }
+
+                accessInfo.count++;
+
+                if (accessInfo.count >= MAX_NO_CREDENTIAL_REQUESTS) {
+                    console.warn(`[AdminAuth] IP ${clientIp} blocked for ${NO_CREDENTIAL_BLOCK_DURATION / 60000} min — excessive unauthenticated requests (${accessInfo.count}/${MAX_NO_CREDENTIAL_REQUESTS}).`);
+                    tempBlocks.set(clientIp, { expires: now + NO_CREDENTIAL_BLOCK_DURATION });
+                    noCredentialAccess.delete(clientIp);
+                } else {
+                    noCredentialAccess.set(clientIp, accessInfo);
+                    if (accessInfo.count % 10 === 0) {
+                        console.log(`[AdminAuth] Unauthenticated access from IP: ${clientIp}. Count: ${accessInfo.count}/${MAX_NO_CREDENTIAL_REQUESTS}`);
+                    }
                 }
             }
 
@@ -461,8 +794,16 @@ const adminAuth = (req, res, next) => {
 // This MUST come before serving static files to protect the panel itself.
 app.use(adminAuth);
 
-// Serve Admin Panel static files only after successful authentication.
-app.use('/AdminPanel', express.static(path.join(__dirname, 'AdminPanel')));
+// 🌟 AdminPanel 独立进程解耦：主进程不再直接提供 AdminPanel 页面
+// 访问主端口的 /AdminPanel 会被重定向到 PORT+1 的独立后台进程
+const ADMIN_PORT = parseInt(port) + 1;
+app.use('/AdminPanel', (req, res) => {
+    // 构建重定向 URL，保留原始路径和查询参数
+    const host = req.hostname;
+    const protocol = req.protocol;
+    const originalPath = req.originalUrl;
+    res.redirect(302, `${protocol}://${host}:${ADMIN_PORT}${originalPath}`);
+});
 
 
 // Image server logic is now handled by the ImageServer plugin.
@@ -505,6 +846,27 @@ app.use((req, res, next) => {
 
 app.get('/v1/models', async (req, res) => {
     const { default: fetch } = await import('node-fetch');
+    const appendSemanticRouterModels = (modelsData) => {
+        const virtualModels = semanticModelRouter.getVirtualModels();
+        if (!virtualModels.length) return modelsData;
+
+        if (!modelsData || typeof modelsData !== 'object') {
+            modelsData = { object: 'list', data: [] };
+        }
+        if (!Array.isArray(modelsData.data)) {
+            modelsData.data = [];
+        }
+
+        const existingIds = new Set(modelsData.data.map(model => model && model.id).filter(Boolean));
+        for (const virtualModel of virtualModels) {
+            if (!existingIds.has(virtualModel.id)) {
+                modelsData.data.push(virtualModel);
+                existingIds.add(virtualModel.id);
+            }
+        }
+        return modelsData;
+    };
+
     try {
         const modelsApiUrl = `${apiUrl}/v1/models`;
         const apiResponse = await fetch(modelsApiUrl, {
@@ -516,27 +878,30 @@ app.get('/v1/models', async (req, res) => {
             },
         });
 
-        // 新增：如果启用了模型重定向，需要处理模型列表响应
-        if (modelRedirectHandler.isEnabled() && apiResponse.ok) {
+        if (apiResponse.ok) {
             const responseText = await apiResponse.text();
             try {
-                const modelsData = JSON.parse(responseText);
+                let modelsData = JSON.parse(responseText);
 
-                // 替换模型列表中的内部模型名为公开模型名
-                if (modelsData.data && Array.isArray(modelsData.data)) {
-                    modelsData.data = modelsData.data.map(model => {
-                        if (model.id) {
-                            const publicModelName = modelRedirectHandler.redirectModelForClient(model.id);
-                            if (publicModelName !== model.id) {
-                                if (DEBUG_MODE) {
-                                    console.log(`[ModelRedirect] 模型列表重定向: ${model.id} -> ${publicModelName}`);
+                // 新增：如果启用了模型重定向，需要处理模型列表响应
+                if (modelRedirectHandler.isEnabled()) {
+                    if (modelsData.data && Array.isArray(modelsData.data)) {
+                        modelsData.data = modelsData.data.map(model => {
+                            if (model.id) {
+                                const publicModelName = modelRedirectHandler.redirectModelForClient(model.id);
+                                if (publicModelName !== model.id) {
+                                    if (DEBUG_MODE) {
+                                        console.log(`[ModelRedirect] 模型列表重定向: ${model.id} -> ${publicModelName}`);
+                                    }
+                                    return { ...model, id: publicModelName };
                                 }
-                                return { ...model, id: publicModelName };
                             }
-                        }
-                        return model;
-                    });
+                            return model;
+                        });
+                    }
                 }
+
+                modelsData = appendSemanticRouterModels(modelsData);
 
                 // 设置响应头
                 res.status(apiResponse.status);
@@ -550,22 +915,24 @@ app.get('/v1/models', async (req, res) => {
                 res.json(modelsData);
                 return;
             } catch (parseError) {
-                console.warn('[ModelRedirect] 解析模型列表响应失败，使用原始响应:', parseError.message);
-                // 如果解析失败，回退到原始流式转发
+                console.warn('[Models] 解析模型列表响应失败，返回语义路由虚拟模型列表:', parseError.message);
+                const fallbackModelsData = appendSemanticRouterModels({ object: 'list', data: [] });
+                if (fallbackModelsData.data.length > 0) {
+                    return res.status(200).json(fallbackModelsData);
+                }
+                // 如果解析失败且没有虚拟模型，回退到错误响应
             }
         }
 
-        // 原始的流式转发逻辑（当模型重定向未启用或解析失败时使用）
-        res.status(apiResponse.status);
-        apiResponse.headers.forEach((value, name) => {
-            // Avoid forwarding hop-by-hop headers
-            if (!['content-encoding', 'transfer-encoding', 'connection', 'content-length', 'keep-alive'].includes(name.toLowerCase())) {
-                res.setHeader(name, value);
-            }
-        });
+        // 上游模型列表不可用时，仍返回语义路由虚拟模型，避免前端无法选择 VCPModelAuto。
+        const fallbackModelsData = appendSemanticRouterModels({ object: 'list', data: [] });
+        if (fallbackModelsData.data.length > 0) {
+            return res.status(200).json(fallbackModelsData);
+        }
 
-        // Stream the response body back to the client
-        apiResponse.body.pipe(res);
+        res.status(apiResponse.status);
+        const errorText = await apiResponse.text();
+        res.type('text/plain').send(errorText);
 
     } catch (error) {
         console.error('转发 /v1/models 请求时出错:', error.message, error.stack);
@@ -636,6 +1003,15 @@ app.post('/v1/schedule_task', async (req, res) => {
         console.error(`[Server] 通过API创建定时任务文件时出错:`, error);
         res.status(500).json({ status: "error", error: "在服务器上保存定时任务时发生内部错误。" });
     }
+});
+
+// 新增：生命周期状态查询路由
+app.get('/admin_api/server/lifecycle', (req, res) => {
+    res.status(200).json({
+        status: 'success',
+        lifecycle: getServerLifecycleStatus(),
+        shutdownExitCode: lastShutdownExitCode
+    });
 });
 
 // 新增：紧急停止路由
@@ -759,6 +1135,7 @@ const chatCompletionHandler = new ChatCompletionHandler({
     pluginManager,
     activeRequests,
     writeDebugLog,
+    writeChatLog,
     handleDiaryFromAIResponse,
     webSocketServer,
     DEBUG_MODE,
@@ -787,7 +1164,8 @@ const chatCompletionHandler = new ChatCompletionHandler({
     detectors,
     superDetectors,
     chinaModel1: CHINA_MODEL_1,
-    chinaModel1Cot: CHINA_MODEL_1_COT
+    chinaModel1Cot: CHINA_MODEL_1_COT,
+    semanticModelRouter
 });
 
 // Route for standard chat completions. VCP info is shown based on the .env config.
@@ -818,6 +1196,11 @@ app.post('/v1/chatvcp/completions', async (req, res) => {
     }
 });
 
+// 协议桥接路由：支持 OpenAI Responses API、Anthropic Messages、Gemini GenerateContent
+// 将这些协议格式的请求转换为标准 messages 数组后内部转发到 /v1/chat/completions
+const protocolBridge = require('./routes/protocolBridge');
+app.use(protocolBridge);
+
 // 新增：人类直接调用工具的端点
 app.post('/v1/human/tool', async (req, res) => {
     try {
@@ -826,43 +1209,31 @@ app.post('/v1/human/tool', async (req, res) => {
             return res.status(400).json({ error: 'Request body must be a non-empty plain text.' });
         }
 
-        const toolRequestStartMarker = "<<<[TOOL_REQUEST]>>>";
-        const toolRequestEndMarker = "<<<[END_TOOL_REQUEST]>>>";
+        const extractedToolBlock = ToolCallParser.extractNextToolBlock(requestBody);
 
-        const startIndex = requestBody.indexOf(toolRequestStartMarker);
-        const endIndex = requestBody.indexOf(toolRequestEndMarker, startIndex);
-
-        if (startIndex === -1 || endIndex === -1) {
+        if (!extractedToolBlock) {
             return res.status(400).json({ error: 'Malformed request: Missing TOOL_REQUEST markers.' });
         }
 
-        const requestBlockContent = requestBody.substring(startIndex + toolRequestStartMarker.length, endIndex).trim();
+        const parsedToolCall = ToolCallParser.parseBlock(extractedToolBlock.blockContent);
 
-        let parsedToolArgs = {};
-        let requestedToolName = null;
-        const paramRegex = /([\w_]+)\s*:\s*「始」([\s\S]*?)「末」\s*(?:,)?/g;
-        let regexMatch;
-
-        while ((regexMatch = paramRegex.exec(requestBlockContent)) !== null) {
-            const key = regexMatch[1];
-            const value = regexMatch[2].trim();
-            if (key === "tool_name") {
-                requestedToolName = value;
-            } else {
-                parsedToolArgs[key] = value;
-            }
-        }
-
-        if (!requestedToolName) {
+        if (!parsedToolCall || !parsedToolCall.name) {
             return res.status(400).json({ error: 'Malformed request: tool_name not found within the request block.' });
         }
+
+        const requestedToolName = parsedToolCall.name;
+        const parsedToolArgs = parsedToolCall.args || {};
 
         if (DEBUG_MODE) {
             console.log(`[Human Tool Exec] Received tool call for: ${requestedToolName}`, parsedToolArgs);
         }
 
-        // 直接调用插件管理器
-        const result = await pluginManager.processToolCall(requestedToolName, parsedToolArgs);
+        // 直接调用插件管理器，并传递 requestIp 以支持分布式文件拉取
+        let clientIp = req.ip;
+        if (clientIp && clientIp.substr(0, 7) === "::ffff:") {
+            clientIp = clientIp.substr(7);
+        }
+        const result = await pluginManager.processToolCall(requestedToolName, parsedToolArgs, clientIp, 'human/tool');
 
         // processToolCall 的结果已经是正确的对象格式
         res.status(200).json(result);
@@ -1005,16 +1376,34 @@ async function handleDiaryFromAIResponse(responseText) {
 // Define dailyNoteRootPath here as it's needed by the adminPanelRoutes module
 // and was previously defined within the moved block.
 const dailyNoteRootPath = process.env.KNOWLEDGEBASE_ROOT_PATH || path.join(__dirname, 'dailynote');
+const knowledgeRootPath = process.env.TDB_KNOWLEDGE_ROOT_PATH
+    ? (path.isAbsolute(process.env.TDB_KNOWLEDGE_ROOT_PATH)
+        ? process.env.TDB_KNOWLEDGE_ROOT_PATH
+        : path.resolve(__dirname, process.env.TDB_KNOWLEDGE_ROOT_PATH))
+    : path.join(__dirname, 'knowledge');
 
 // Import and use the admin panel routes, passing the getter for currentServerLogPath
 const adminPanelRoutes = require('./routes/adminPanelRoutes')(
     DEBUG_MODE,
     dailyNoteRootPath,
     pluginManager,
+    knowledgeRootPath,
     logger.getServerLogPath, // Pass the getter function
     knowledgeBaseManager, // Pass the knowledgeBaseManager instance
     AGENT_DIR, // Pass the Agent directory path
-    cachedEmojiLists
+    cachedEmojiLists,
+    TVS_DIR, // Pass the TVStxt directory path
+    (code = 1) => {
+        console.log(`[Server] Restart triggered from admin API (exit code: ${code}).`);
+        gracefulShutdown(code, 'admin_restart').catch(err => {
+            console.error('[Server] Fatal error during graceful restart:', err);
+            process.exit(code);
+        });
+    },
+    semanticModelRouter,
+    modelRedirectHandler,
+    apiUrl,
+    apiKey
 );
 
 // 新增：引入 VCP 论坛 API 路由
@@ -1085,8 +1474,18 @@ async function initialize() {
     await knowledgeBaseManager.initialize(); // 在加载插件之前启动，确保服务就绪
     console.log('向量数据库初始化完成。');
 
+    console.log('开始初始化 TDB 冷知识库...');
+    await tdbKnowledgeManager.initialize();
+    console.log('TDB 冷知识库初始化完成。');
+
     pluginManager.setProjectBasePath(__dirname);
     pluginManager.setVectorDBManager(knowledgeBaseManager); // 注入 knowledgeBaseManager
+    pluginManager.setTdbKnowledgeManager(tdbKnowledgeManager); // 注入冷知识库管理器
+    await dynamicToolRegistry.initialize({
+        pluginManager,
+        projectBasePath: __dirname,
+        debugMode: DEBUG_MODE
+    });
 
     console.log('开始加载插件...');
     await pluginManager.loadPlugins();
@@ -1110,6 +1509,7 @@ async function initialize() {
     try {
         const dependencies = {
             knowledgeBaseManager,
+            tdbKnowledgeManager,
             vcpLogFunctions: pluginManager.getVCPLogFunctions()
         };
         if (DEBUG_MODE) console.log('[Server] Injecting dependencies into plugins...');
@@ -1187,12 +1587,18 @@ async function startServer() {
 
     // 确保 Agent 目录存在
     await ensureAgentDirectory();
+    // 确保 TVStxt 目录存在
+    await ensureTvsDirectory();
 
     // 新增：加载模型重定向配置
     console.log('正在加载模型重定向配置...');
     modelRedirectHandler.setDebugMode(DEBUG_MODE);
     await modelRedirectHandler.loadModelRedirectConfig(path.join(__dirname, 'ModelRedirect.json'));
     console.log('模型重定向配置加载完成。');
+
+    console.log('正在加载语义模型路由配置...');
+    await semanticModelRouter.initialize(path.join(__dirname, 'SemanticModelRouter.json'), DEBUG_MODE);
+    console.log('语义模型路由配置加载完成。');
 
     // 新增：初始化Agent管理器
     console.log('正在初始化Agent管理器...');
@@ -1201,15 +1607,51 @@ async function startServer() {
     console.log('Agent管理器初始化完成。');
 
     console.log('正在初始化TVS管理器...');
+    tvsManager.setTvsDir(TVS_DIR);
     tvsManager.initialize(DEBUG_MODE);
     console.log('TVS管理器初始化完成。');
+
+    console.log('正在初始化Toolbox管理器...');
+    toolboxManager.setTvsDir(TVS_DIR);
+    await toolboxManager.initialize(DEBUG_MODE);
+    console.log('Toolbox管理器初始化完成。');
+
+    console.log('正在初始化SarPrompt管理器...');
+    await sarPromptManager.initialize(DEBUG_MODE);
+    console.log('SarPrompt管理器初始化完成。');
 
     // 🌟 关键修复：在监听端口前完成所有初始化
     await initialize(); // This loads plugins and initializes services
 
+    // 🌟 核心网络优化：100% 确保首请求的 node-fetch ESM 模块热启动，消除冷启动导致的延迟和上游挂断风险
+    console.log('[Server] 正在预热 node-fetch ESM 模块...');
+    await import('node-fetch');
+    console.log('[Server] node-fetch 模块预热完毕，准备处理请求。');
+
     server = app.listen(port, () => {
         console.log(`中间层服务器正在监听端口 ${port}`);
         console.log(`API 服务器地址: ${apiUrl}`);
+
+        server.on('connection', (socket) => {
+            trackedSockets.add(socket);
+
+            socket.on('close', () => {
+                trackedSockets.delete(socket);
+                activeHttpRequests.delete(socket);
+            });
+        });
+
+        server.on('request', (req, res) => {
+            if (req.socket) {
+                activeHttpRequests.add(req.socket);
+                res.on('finish', () => {
+                    activeHttpRequests.delete(req.socket);
+                });
+                res.on('close', () => {
+                    activeHttpRequests.delete(req.socket);
+                });
+            }
+        });
 
         // Initialize the new WebSocketServer
         if (DEBUG_MODE) console.log('[Server] Initializing WebSocketServer...');
@@ -1232,39 +1674,132 @@ startServer().catch(err => {
 });
 
 
-async function gracefulShutdown() {
-    console.log('Initiating graceful shutdown...');
-
-    if (taskScheduler) {
-        taskScheduler.shutdown();
+async function gracefulShutdown(exitCode = 0, reason = 'signal') {
+    if (shutdownPromise) {
+        console.log(`[Server] gracefulShutdown already in progress. Reusing existing shutdown promise. Current state: ${serverLifecycleState}`);
+        return shutdownPromise;
     }
 
-    if (webSocketServer) {
-        console.log('[Server] Shutting down WebSocketServer...');
-        webSocketServer.shutdown();
-    }
-    if (pluginManager) {
-        await pluginManager.shutdownAllPlugins();
-    }
+    lastShutdownExitCode = exitCode;
+    shutdownReason = reason;
+    shutdownStartedAt = Date.now();
+    serverLifecycleState = SERVER_LIFECYCLE.DRAINING;
 
-    const serverLogWriteStream = logger.getLogWriteStream();
-    if (serverLogWriteStream) {
-        logger.originalConsoleLog('[Server] Closing server log file stream...');
-        const logClosePromise = new Promise((resolve) => {
-            serverLogWriteStream.end(`[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] Server gracefully shut down.\n`, () => {
-                logger.originalConsoleLog('[Server] Server log stream closed.');
-                resolve();
-            });
-        });
-        await logClosePromise;
-    }
+    console.log(`[Server] Initiating graceful shutdown. reason=${reason}, exitCode=${exitCode}`);
+    console.log(`[Server][ShutdownTrace] Phase 0/10 - shutdown requested. activeRequests=${activeRequests.size}`);
 
-    console.log('Graceful shutdown complete. Exiting.');
-    process.exit(0);
+    forceShutdownTimer = setTimeout(() => {
+        console.error('[Server] Graceful shutdown timed out. Forcing process exit.');
+        serverLifecycleState = SERVER_LIFECYCLE.EXITING;
+        process.exit(exitCode);
+    }, 60000);
+    forceShutdownTimer.unref();
+
+    shutdownPromise = (async () => {
+        try {
+            if (webSocketServer && typeof webSocketServer.beginDrain === 'function') {
+                console.log(`[Server][ShutdownTrace] Phase 1/10 - begin WebSocket drain`);
+                console.log('[Server] Draining WebSocket upgrade handling...');
+                await webSocketServer.beginDrain();
+                console.log(`[Server][ShutdownTrace] Phase 1/10 - WebSocket drain ready`);
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 1/10 - WebSocket drain skipped`);
+            }
+
+            console.log(`[Server][ShutdownTrace] Phase 2/10 - closing HTTP server listener`);
+            await closeHttpServerGracefully();
+            console.log(`[Server][ShutdownTrace] Phase 2/10 - HTTP server listener closed. trackedSockets=${trackedSockets.size}, activeHttpRequests=${activeHttpRequests.size}`);
+
+            console.log(`[Server][ShutdownTrace] Phase 3/10 - waiting active requests to drain (initial=${activeRequests.size})`);
+            const drainedNaturally = await waitForActiveRequestsToDrain(30000);
+            console.log(`[Server][ShutdownTrace] Phase 3/10 - drain wait result=${drainedNaturally}, remaining=${activeRequests.size}`);
+
+            if (!drainedNaturally) {
+                console.warn(`[Server] Active requests did not drain within timeout. Remaining: ${activeRequests.size}`);
+                console.log(`[Server][ShutdownTrace] Phase 4/10 - aborting remaining active requests`);
+                await abortAllActiveRequests('服务正在重启，当前请求已被服务器安全中止。');
+                const drainedAfterAbort = await waitForActiveRequestsToDrain(5000);
+                console.log(`[Server][ShutdownTrace] Phase 4/10 - abort complete. drainedAfterAbort=${drainedAfterAbort}, remaining=${activeRequests.size}`);
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 4/10 - abort skipped, no remaining active requests`);
+            }
+
+            serverLifecycleState = SERVER_LIFECYCLE.SHUTTING_DOWN;
+            console.log(`[Server][ShutdownTrace] Phase 5/10 - lifecycle switched to SHUTTING_DOWN`);
+
+            if (taskScheduler) {
+                console.log(`[Server][ShutdownTrace] Phase 6/10 - taskScheduler.shutdown start`);
+                taskScheduler.shutdown();
+                console.log(`[Server][ShutdownTrace] Phase 6/10 - taskScheduler.shutdown done`);
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 6/10 - taskScheduler shutdown skipped`);
+            }
+
+            if (webSocketServer) {
+                console.log(`[Server][ShutdownTrace] Phase 7/10 - webSocketServer.shutdown start`);
+                console.log('[Server] Shutting down WebSocketServer...');
+                await Promise.resolve(webSocketServer.shutdown());
+                console.log(`[Server][ShutdownTrace] Phase 7/10 - webSocketServer.shutdown done`);
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 7/10 - WebSocketServer shutdown skipped`);
+            }
+
+            if (pluginManager) {
+                console.log(`[Server][ShutdownTrace] Phase 8/10 - pluginManager.shutdownAllPlugins start`);
+                await pluginManager.shutdownAllPlugins();
+                console.log(`[Server][ShutdownTrace] Phase 8/10 - pluginManager.shutdownAllPlugins done`);
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 8/10 - pluginManager shutdown skipped`);
+            }
+
+            if (tdbKnowledgeManager) {
+                console.log(`[Server][ShutdownTrace] Phase 9/10 - tdbKnowledgeManager.shutdown start`);
+                await tdbKnowledgeManager.shutdown();
+                console.log(`[Server][ShutdownTrace] Phase 9/10 - tdbKnowledgeManager.shutdown done`);
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 9/10 - tdbKnowledgeManager shutdown skipped`);
+            }
+
+            if (knowledgeBaseManager) {
+                console.log(`[Server][ShutdownTrace] Phase 9/10 - knowledgeBaseManager.shutdown start`);
+                await knowledgeBaseManager.shutdown();
+                console.log(`[Server][ShutdownTrace] Phase 9/10 - knowledgeBaseManager.shutdown done`);
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 9/10 - knowledgeBaseManager shutdown skipped`);
+            }
+
+            const serverLogWriteStream = logger.getLogWriteStream();
+            if (serverLogWriteStream) {
+                logger.originalConsoleLog('[Server][ShutdownTrace] Phase 10/10 - closing server log file stream');
+                logger.originalConsoleLog('[Server] Closing server log file stream...');
+                const logClosePromise = new Promise((resolve) => {
+                    serverLogWriteStream.end(`[${dayjs().tz(DEFAULT_TIMEZONE).format('YYYY-MM-DD HH:mm:ss Z')}] Server gracefully shut down. reason=${reason}\n`, () => {
+                        logger.originalConsoleLog('[Server] Server log stream closed.');
+                        logger.originalConsoleLog('[Server][ShutdownTrace] Phase 10/10 - server log file stream closed');
+                        resolve();
+                    });
+                });
+                await logClosePromise;
+            } else {
+                console.log(`[Server][ShutdownTrace] Phase 10/10 - log stream close skipped`);
+            }
+        } finally {
+            if (forceShutdownTimer) {
+                clearTimeout(forceShutdownTimer);
+                forceShutdownTimer = null;
+            }
+            serverLifecycleState = SERVER_LIFECYCLE.EXITING;
+        }
+
+        console.log(`[Server][ShutdownTrace] Final - process.exit(${exitCode})`);
+        process.exit(exitCode);
+    })();
+
+    return shutdownPromise;
 }
 
-process.on('SIGINT', gracefulShutdown);
-process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', () => gracefulShutdown(0, 'SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown(0, 'SIGTERM'));
 
 // 新增：捕获未处理的异常，防止服务器崩溃
 process.on('uncaughtException', (error) => {

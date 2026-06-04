@@ -2,7 +2,7 @@
 
 此文档记录 OpenWebUI HTML Live Preview 系列脚本的技术说明与版本变更历史。
 
-本项目由两个部分组成：
+本项目由三个部分组成：
 1. OpenWebUI Action 函数（Python，服务端）—— 负责从模型回复中提取 HTML 并通过 `HTMLResponse` 渲染到 iframe。v0.3.0 起支持多代码块合并渲染（用 `<section data-vcp-block>` 分隔）。
 2. 油猴脚本（JavaScript，客户端）—— 负责在聊天流中自动检测 HTML 代码块，触发 Action 渲染，并将 iframe 原位替换到代码块位置（"遮点挪"）。v0.3.0 起支持多气泡拆分定位。
 
@@ -32,6 +32,13 @@
 
 ### CHANGELOG
 
+#### v0.6.0 (2026-03-14)
+- **分段触发 (Segmented Triggering)**：实现流式输出中途渲染。脚本不再等待整条消息结束，而是实时判定 HTML 块的闭合状态并触发渲染。
+- **直连 Action API**：通过 `POST /api/chat/actions/html_live_preview` 直接获取后端渲染后的 HTML 文档，绕过了对 Action 按钮的依赖。
+- **防顶帖优化**：在刷新或查看历史消息时，彻底禁用自动点击 Action 按钮的行为，优先从既有 iframe 搬运内容，解决了页面强制回弹到顶部的体验痛点。
+- **极其保守的闭合判定**：引入 `compareDocumentPosition` 校验，只有检测到代码块后方出现实质性新内容时才收口，防止提前渲染导致的内容残缺。
+- **任务重开机制**：支持“气泡-文字-气泡”复杂结构的流式追加，确保后续气泡不会被漏掉。
+
 #### v0.3.0（2026-02-23）
 - 多代码块合并渲染：用 `<section data-vcp-block="N">` 包裹每个代码块，合并进统一母文档。
 - 不完整 HTML 包裹逻辑从整体判断改为逐块判断。
@@ -57,10 +64,10 @@
 
 ## OpenWebUI HTML Auto-Render（遮点挪）油猴脚本
 
-- 文件：`openwebui_html_auto_render/openwebui_html_auto_render_0.5.0.js`
+- 文件：`openwebui_html_auto_render/openwebui_html_auto_render_0.6.0.js`
 - 类型：Tampermonkey 用户脚本（兼容非油猴环境，CSS/JS 可拆分复用）
-- 依赖：Action 函数 v0.3.0+（需要 `data-vcp-block` 分隔标记支持多气泡拆分）
-- 外部依赖：html2canvas 1.4.1（运行时从 jsDelivr CDN 动态加载，用于截图导出）
+- 依赖：Action函数 v0.3.0+（需要 `data-vcp-block` 分隔标记支持多气泡拆分）
+- 外部依赖：dom-to-image-more v3（运行时从 jsDelivr CDN 动态加载，SVG foreignObject 截图引擎）
 - 作者：B3000Kcn & DBL1F7E5
 
 ### 工作原理（"遮点挪"三步模型 — 多气泡版）
@@ -78,18 +85,19 @@ v0.3.0 将处理粒度从"代码块级独立流程"提升为"消息级协调流�
 - 对每个代码块执行越狱 + 软隐藏 + 插入占位卡片。
 - 启动块级内容稳定监听和消息级流式输出监听。
 
-#### Action 按钮监听（零延迟触发）
-- v0.4.0 废弃了防抖计时器（`STREAM_SETTLE_MS` / `MSG_STREAM_SETTLE_MS`），改为监听 Action 按钮出现。
-- OpenWebUI 在消息生成完毕后才渲染 Action 按钮，因此按钮出现 = 消息完成的精确信号。
-- 遮阶段注册块后，立即检查 Action 按钮是否已存在：
-  - 已存在：立即触发点击（历史消息/刷新场景）。
-  - 不存在：启动 `MutationObserver` 监听消息容器，按钮一出现立即触发。
-- 相比旧版盲等 2s 的防抖方案，延迟从 ~2-3s 降至接近零。
-
-#### 点（Click）
-- Action 按钮出现后立即触发点击，无需等待块内容稳定或流式结束。
-- 若按钮尚未出现（理论上不会，因为监听会捕获），采用退避重试（初始 200ms，×1.2 退避，上限 2000ms）。
-- 若 iframe 已存在（快速路径命中），跳过点击直接进入搬运。
+#### API 直连监听（分段触发）
+- v0.6.0 将触发信号从“等待 Action 按钮出现并点击”升级为“**每新增一个 HTML 块结束，就直连 Action API 渲染一次**”，从而支持**流式未结束也能渲染**。
+- 关键点：Action 函数仅依赖 `body.messages` 的最后一条 `assistant` 内容（正则提取 ```html 代码块），并不依赖 OpenWebUI 前端的“流式结束态”。
+- 遮阶段注册块后：
+  - 若发现 Action 按钮已存在（结束态/刷新态）：**不点击 Action**，直接走“搬运/本地渲染”收尾，避免顶帖。
+  - 若按钮不存在（流式进行中）：启动两类监听判断“代码块结束”：
+    1. `cm-content` 的静默计时器（`BLOCK_IDLE_CLOSE_MS`）作为兜底（末尾块/无后继内容）。
+    2. 监听消息容器中“新增内容出现在当前代码块之外”的 DOM 证据（意味着 markdown fence 已关闭，stream 已移出 code block）。
+- 每当某个 block 被判定结束（close）：
+  - 组装伪造 `assistant` 消息内容（把已结束的 N 个块包裹为 ```html fences）
+  - `fetch POST /api/chat/actions/html_live_preview` 获取返回的 HTML 文档（含 `<section data-vcp-block="N">`）
+  - 按 `data-vcp-block` 拆分，仅对“新增块”创建 iframe 并原位替换占位卡（不重复刷新旧块）
+- 若 Action API 调用失败（401/403/422 等），自动禁用 API，改走 CM 源码本地渲染，避免刷请求。
 
 #### 挪（Move）— 拆分定位
 - 轮询查找消息容器内生成的 `iframe[title="Embedded Content"]`。
@@ -105,10 +113,10 @@ v0.3.0 将处理粒度从"代码块级独立流程"提升为"消息级协调流�
 
 #### 快速路径（Fast Path）
 - 页面刷新时按消息容器分组批量扫描。
-- v0.4.0 改进：优先检测 Action 按钮是否已存在（而非轮询等 iframe）。
+- v0.6.0 改进：**不再点击 Action**（避免后端将话题标记为已修改而“顶帖”）。
   - 按钮已存在 + iframe 已存在：直接拆分搬运（纯前端，不触发 Action）。
-  - 按钮已存在 + 无 iframe：先探测 iframe 是否即将出现（最多 2.25s），探测到则直接搬运；超时才点击 Action。
-  - 按钮不存在：走正常流程（流式进行中）。
+  - 按钮已存在 + 无 iframe：先探测 iframe 是否即将出现（最多 2.25s），探测到则直接搬运；探测不到则直接 CM 本地渲染兜底。
+  - 按钮不存在：走正常流程（流式进行中，使用分段触发 + API 直连）。
 - `initialScanDone` 守卫：`initialScan()` 完成前 MO 不处理块，确保快速路径优先执行。
 - 若 srcdoc 含 `data-vcp-block` 标记，拆分后分别定位。
 - 若无标记（旧版），单气泡直接搬运，多气泡回退 CM 自渲染。
@@ -133,16 +141,52 @@ v0.3.0 将处理粒度从"代码块级独立流程"提升为"消息级协调流�
 | `RETRY_MAX_INTERVAL` | 2000 | 重试间隔上限（ms） |
 | `FAST_PROBE_INTERVAL` | 150 | 快速路径探测间隔（ms） |
 | `FAST_PROBE_MAX` | 15 | 快速路径最大探测次数 |
-| `HTML2CANVAS_CDN` | jsDelivr URL | html2canvas 动态加载地址 |
-| `HTML2CANVAS_LOAD_TIMEOUT_MS` | 12000 | html2canvas 加载超时（ms） |
-| `CAPTURE_MAX_CANVAS_DIM` | 16384 | canvas 单边像素上限 |
-| `CAPTURE_MAX_SCALE` | 3 | 截图缩放倍率上限（桌面；触屏自动降到 2） |
-| `CAPTURE_TRIM_ALPHA_THRESHOLD` | 8 | 透明边缘裁切 alpha 阈值 |
-| `CAPTURE_TRIM_PADDING` | 2 | 裁切后保留像素边距（防抗锯齿丢失） |
+| `DOMTOIMAGE_CDN` | jsDelivr URL | dom-to-image-more v3 动态加载地址 |
+| `DOMTOIMAGE_LOAD_TIMEOUT_MS` | 12000 | dom-to-image-more 加载超时（ms） |
+| `CAPTURE_SCALE` | 3 | 截图分辨率倍率（3x 超清；触屏设备自动降为 2x） |
 | `TOAST_MS` | 1600 | toast 提示显示时长（ms） |
 | `DEBUG` | true | 是否输出调试日志 |
 
 ### CHANGELOG
+
+#### v0.6.0（2026-03-14）
+- **分段触发 + 直连 Action API**：每新增一个 HTML 块结束，就调用 `/api/chat/actions/html_live_preview` 渲染一次；同一块流式期间不反复刷新。
+- **流式中途渲染**：不再依赖 Action 按钮出现（消息结束信号），支持流式未结束先渲染。
+- **刷新/历史消息不顶帖**：快速路径不再“直接点击 Action”，优先搬运已有 iframe；无 iframe 则 CM 本地渲染兜底，避免顶帖。
+- 保留 v0.5.5 的高度锚点法与截图工具栏能力，本次仅升级触发链路。
+
+#### v0.5.5（2026-03-14）
+- **高度锚点法 (Anchor Method)**：引入 `offsetTop` 锚点测量机制，彻底解决 `scrollHeight` 被 `clientHeight` 托住导致的不回缩（留空白）问题。
+- **滚动锁死修复**：废弃会导致滚动锚定异常的 `1px` 探针方案，配合 `overflow-anchor: none` 确保页面滚动丝滑。
+- **挤压恢复优化**：绑定 iframe 内部 `resize` 事件，窗口宽度恢复时立即校准高度。
+- **截图锁**：新增 `__vcpCapturing` 状态锁，防止截图期间高度抖动，并增加延迟校准。
+- 此版本为当前稳定版。
+
+#### v0.5.4（2026-03-14）
+- 修复 iframe 高度“撑大后不回缩”导致气泡下方空白的问题：
+  - 复现路径：窗口缩窄导致内容换行变长→高度被撑大；恢复宽度后内容变矮但 iframe 高度不回收；或复制/保存截图后出现空白。
+  - 根因：使用 `scrollHeight` 测量时会被 `clientHeight` 下限托住（iframe 已经被设置为更高时，`scrollHeight` 不会变小），导致无法回缩。
+  - 方案：引入“可回缩”的自适应高度绑定（`ensureAutoHeight`），使用 `ResizeObserver` + rAF 节流并改进测量逻辑，允许高度回缩。
+- 复制/保存后增加强制高度校准：避免截图链路触发布局变化后留下空白。
+- 单气泡“直接搬运原 embeds iframe”分支也绑定自适应高度，行为一致。
+- 此版本为当前稳定版。
+
+#### v0.5.3（2026-02-26）
+- 截图引擎更换：html2canvas → dom-to-image-more v3（SVG foreignObject 方案）。- 根因：html2canvas 在 JS 中重新实现 CSS渲染，复杂特效（backdrop-filter、mix-blend-mode、CSS 变量、渐变、动画等）无法完整还原，导致导出图"特效不全"。
+  - 新方案：dom-to-image-more 将 DOM 序列化为 SVG foreignObject，由浏览器自身渲染引擎绘制，CSS 特效 100% 保真。
+- 智能内容区域检测（`findCaptureTarget`）：遍历 body 直接子元素，过滤掉 SCRIPT/STYLE/LINK/META/NOSCRIPT 及隐藏/零尺寸元素。单可见子元素→精确截取该元素（卡片区）；多可见子元素→截取 body；无可见子元素→回退 body。"有内容才算卡片区"。
+- 内容裁切修复：使用 `Math.max(offsetWidth, scrollWidth, clientWidth)` 三取最大值作为截取尺寸，显式传入 dom-to-image-more 的 width/height 参数，防止 overflow 内容右边/下边被吃掉。
+- 高分辨率输出：新增 `CAPTURE_SCALE: 3`（3x 超清），通过 `style.transform: scale(N)` + canvas尺寸=原始×N 的标准高DPI 方案。触屏设备自动降为 2x 避免内存压力。
+- 圆角保留：不再对导出图做任何 border-radius 重置，保持 iframe 中看到的原始圆角效果。
+- 代码清理：移除 html2canvas 全部相关代码（~200 行），包括 `html2canvasPromise`、`findHtml2Canvas()`、`ensureHtml2CanvasLoaded()`、`ensureHtml2CanvasLoadedInWindow()`、`waitFontsReady()`、`canvasToBlob()`、`trimTransparentEdges()`、`captureIframeToCanvas()`、`CAPTURE_RESET_CSS` 及所有 html2canvas CONFIG 常量。
+- 思源简易浏览器版同步拆分：详见下方"思源版"章节。
+- 此版本为当前稳定版。
+
+#### v0.5.2（2026-02-26）
+- 截图导出风格策略调整：导出时保留卡片背景与视觉特效（不再强制透明背景），使导出图更接近用户在 iframe 中看到的实际风格。
+- 在导出克隆文档中仅移除外层圆角/去边框：`CAPTURE_RESET_CSS` 仅对 `html, body` 设置 `border-radius: 0` 与 `border: none`，保留卡片内部组件的圆角与视觉层次。
+- 继续沿用 v0.5.1 的 onclone 方案：仅修改 html2canvas 克隆文档，不触碰真实 iframe DOM，避免复制/保存时页面抽搐。
+- 此版本为当前稳定版。
 
 #### v0.5.0（2026-02-23）
 - 新增"复制/保存"悬浮工具栏：每个渲染出的 iframe 右上角显示"复制"和"保存"按钮，桌面端 hover 时浮现，触屏设备点击 iframe 区域切换工具栏显隐（不再常显，避免遮挡内容）。
@@ -158,6 +202,7 @@ v0.3.0 将处理粒度从"代码块级独立流程"提升为"消息级协调流�
 - iframe 滚动条修复（同日补丁）：
   - 根因：`createIframeFromHtml()` 的 `load` 回调中首次 `scrollHeight` 测量时字体/布局可能未完全稳定，导致高度偏矮几像素，产生"能滚但只滚一点"的滚动条。后续气泡因浏览器缓存不受影响。
   - 修复：iframe 加 `scrolling="no"` + CSS `overflow: hidden` 双层禁止滚动条；`resizeToContent()` 在 `load` 后额外延迟 50ms 和 200ms 各做一次二次测量；`scrollHeight` 取值改为 `Math.max(documentElement.scrollHeight, body.scrollHeight)` 更稳健。
+- 思源简易浏览器版拆分：从油猴脚本拆出独立 CSS + JS 文件，详见下方"思源版"章节。
 - 刷新免点击修复（同日补丁）：
   - 根因：刷新时 Action 按钮先于 iframe 出现在 DOM 中，`triggerAction()` 检测到按钮已存在但 `findIframe()` 返回 null，直接走 `doClick()` 重新点击 Action，导致话题被后端标记为"已修改"并被顶上去。
   - 修复：`triggerAction()` 新增 `probeIframeThenClick()`，当按钮已存在但 iframe 未出现时，先轮询探测 iframe（150ms × 15 = 最多 2.25s）。探测到 iframe 则直接拆分搬运（纯前端，后端无感知）；超时后才真正点击 Action（流式新消息场景）。
